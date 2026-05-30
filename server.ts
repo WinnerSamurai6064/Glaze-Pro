@@ -6,7 +6,6 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 
 type NotificationType = "like" | "comment" | "repost" | "follow";
-
 interface User { id: string; email: string; username: string; displayName: string; bio: string; profilePic: string; bannerPic: string; createdAt: string; isVerified?: boolean; }
 interface Post { id: string; userId: string; content: string; image?: string; createdAt: string; likesCount: number; repostsCount: number; commentsCount: number; }
 interface Comment { id: string; postId: string; userId: string; content: string; createdAt: string; }
@@ -17,11 +16,11 @@ interface Notification { id: string; type: NotificationType; senderId: string; r
 interface Message { id: string; senderId: string; receiverId: string; content: string; createdAt: string; seen: boolean; }
 interface EmailOtp { id: string; email: string; codeHash: string; expiresAt: string; attempts: number; usedAt?: string; createdAt: string; }
 interface DB { users: User[]; posts: Post[]; comments: Comment[]; likes: Like[]; reposts: Repost[]; follows: Follow[]; notifications: Notification[]; messages: Message[]; emailOtps: EmailOtp[]; }
+interface GoogleProfile { email?: string; name?: string; picture?: string; email_verified?: boolean; }
 
 const DB_FILE = path.join(process.cwd(), "db.json");
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
 const OTP_MAX_ATTEMPTS = Number(process.env.OTP_MAX_ATTEMPTS || 5);
-
 function emptyDB(): DB { return { users: [], posts: [], comments: [], likes: [], reposts: [], follows: [], notifications: [], messages: [], emailOtps: [] }; }
 function normalizeDB(db: Partial<DB>): DB { return { ...emptyDB(), ...db, users: db.users || [], posts: db.posts || [], comments: db.comments || [], likes: db.likes || [], reposts: db.reposts || [], follows: db.follows || [], notifications: db.notifications || [], messages: db.messages || [], emailOtps: db.emailOtps || [] }; }
 function loadDB(): DB { if (fs.existsSync(DB_FILE)) { try { return normalizeDB(JSON.parse(fs.readFileSync(DB_FILE, "utf-8"))); } catch (err) { console.error("db.json read failed", err); } } const db = emptyDB(); saveDB(db); return db; }
@@ -34,8 +33,11 @@ function usernameFromEmail(email: string, users: User[]) { const base = (email.s
 function publicUser(user: User) { return { id: user.id, email: user.email, username: user.username, displayName: user.displayName, bio: user.bio, profilePic: user.profilePic, bannerPic: user.bannerPic, createdAt: user.createdAt, isVerified: user.isVerified }; }
 function findUser(db: DB, idOrUsername: string) { return db.users.find(u => u.id === idOrUsername || u.username.toLowerCase() === idOrUsername.toLowerCase()); }
 function getAuthUserId(req: express.Request, db: DB) { const h = req.headers.authorization; if (!h?.startsWith("Bearer ")) return null; const token = h.slice(7).trim(); return db.users.some(u => u.id === token) ? token : null; }
-function getOrCreateUser(db: DB, email: string) { let user = db.users.find(u => u.email.toLowerCase() === email); if (user) { user.isVerified = true; return user; } const username = usernameFromEmail(email, db.users); user = { id: makeId("usr"), email, username, displayName: username, bio: "Connect, explore and discover your voice", profilePic: `https://api.dicebear.com/7.x/pixel-art/svg?seed=${encodeURIComponent(username)}`, bannerPic: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800&auto=format&fit=crop&q=80", createdAt: new Date().toISOString(), isVerified: true }; db.users.push(user); return user; }
+function getOrCreateUser(db: DB, email: string, profile?: Partial<User>) { let user = db.users.find(u => u.email.toLowerCase() === email); if (user) { user.isVerified = true; if (profile?.displayName) user.displayName = profile.displayName; if (profile?.profilePic) user.profilePic = profile.profilePic; return user; } const username = usernameFromEmail(email, db.users); user = { id: makeId("usr"), email, username, displayName: profile?.displayName || username, bio: "Connect, explore and discover your voice", profilePic: profile?.profilePic || `https://api.dicebear.com/7.x/pixel-art/svg?seed=${encodeURIComponent(username)}`, bannerPic: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800&auto=format&fit=crop&q=80", createdAt: new Date().toISOString(), isVerified: true }; db.users.push(user); return user; }
 function enrichPost(db: DB, p: Post, currentUserId: string | null) { const u = db.users.find(x => x.id === p.userId); return { ...p, user: u ? { id: u.id, username: u.username, displayName: u.displayName, profilePic: u.profilePic, isVerified: u.isVerified } : { id: "deleted", username: "deleted", displayName: "Deleted Account", profilePic: "https://api.dicebear.com/7.x/pixel-art/svg?seed=deleted", isVerified: false }, likedByCurrentUser: currentUserId ? db.likes.some(l => l.postId === p.id && l.userId === currentUserId) : false, repostedByCurrentUser: currentUserId ? db.reposts.some(r => r.postId === p.id && r.userId === currentUserId) : false }; }
+function appBaseUrl(req: express.Request) { return (process.env.APP_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, ""); }
+function googleRedirectUri(req: express.Request) { return process.env.GOOGLE_REDIRECT_URI || `${appBaseUrl(req)}/api/auth/google/callback`; }
+function renderOAuthDone(user: User) { const safeUser = JSON.stringify(publicUser(user)).replace(/</g, "\\u003c"); return `<!doctype html><html><head><title>Glaze Login</title></head><body style="background:#000;color:#fff;font-family:sans-serif"><script>localStorage.setItem('glaze_session_user', ${JSON.stringify(safeUser)}); window.location.href='/';</script><p>Signing you into Glaze...</p></body></html>`; }
 
 async function run() {
   const app = express();
@@ -43,98 +45,60 @@ async function run() {
   const db = loadDB();
   const otpCooldowns = new Map<string, number>();
   const postCooldowns = new Map<string, number>();
+  const googleStates = new Set<string>();
+  app.get("/api/health", (_, res) => res.json({ status: "ok", auth: "email-otp-google" }));
 
-  app.get("/api/health", (_, res) => res.json({ status: "ok", auth: "email-otp" }));
-
-  app.post("/api/auth/request-otp", (req, res) => {
-    const email = normalizeEmail(req.body.email);
-    if (!email.includes("@")) return res.status(400).json({ error: "A valid email address is required." });
-    const now = Date.now();
-    if (now - (otpCooldowns.get(email) || 0) < 60000) return res.status(429).json({ error: "Please wait before requesting another code." });
-    const otp = generateOtp();
-    db.emailOtps = db.emailOtps.filter(o => !(o.email === email && !o.usedAt));
-    db.emailOtps.push({ id: makeId("otp"), email, codeHash: hashValue(otp), expiresAt: new Date(now + OTP_TTL_MINUTES * 60000).toISOString(), attempts: 0, createdAt: new Date().toISOString() });
-    otpCooldowns.set(email, now);
-    saveDB(db);
-    console.log(`\n[GLAZE OTP] ${email}: ${otp}\n`);
-    res.json({ success: true, message: `Access code sent to ${email}. In local VM/dev mode, check the server logs for the OTP.` });
+  app.get("/api/auth/google/start", (req, res) => {
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) return res.status(500).send("Google auth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.");
+    const state = makeId("gstate"); googleStates.add(state); setTimeout(() => googleStates.delete(state), 10 * 60 * 1000);
+    const params = new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: googleRedirectUri(req), response_type: "code", scope: "openid email profile", access_type: "online", prompt: "select_account", state });
+    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
   });
 
-  app.post("/api/auth/verify-otp", (req, res) => {
-    const email = normalizeEmail(req.body.email);
-    const otp = String(req.body.otp || "").replace(/\D/g, "");
-    const record = [...db.emailOtps].reverse().find(o => o.email === email && !o.usedAt);
-    if (!record) return res.status(400).json({ error: "No active code found. Request a new code." });
-    if (Date.now() > new Date(record.expiresAt).getTime()) return res.status(400).json({ error: "Code expired. Request a new one." });
-    if (record.attempts >= OTP_MAX_ATTEMPTS) return res.status(429).json({ error: "Too many wrong attempts. Request a new code." });
-    record.attempts += 1;
-    if (record.codeHash !== hashValue(otp)) { saveDB(db); return res.status(400).json({ error: "Invalid access code." }); }
-    record.usedAt = new Date().toISOString();
-    const user = getOrCreateUser(db, email);
-    saveDB(db);
-    res.json({ success: true, user: publicUser(user), token: user.id });
+  app.get("/api/auth/google/callback", async (req, res) => {
+    try {
+      const code = String(req.query.code || ""); const state = String(req.query.state || "");
+      if (!code || !googleStates.has(state)) return res.status(400).send("Invalid Google auth state.");
+      googleStates.delete(state);
+      const tokenRes = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: process.env.GOOGLE_CLIENT_ID || "", client_secret: process.env.GOOGLE_CLIENT_SECRET || "", redirect_uri: googleRedirectUri(req), grant_type: "authorization_code" }) });
+      const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
+      if (!tokenRes.ok || !tokenData.access_token) throw new Error(tokenData.error || "Google token exchange failed");
+      const profileRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { Authorization: `Bearer ${tokenData.access_token}` } });
+      const profile = await profileRes.json() as GoogleProfile;
+      const email = normalizeEmail(profile.email || "");
+      if (!email || profile.email_verified === false) return res.status(403).send("Google email is not verified.");
+      const user = getOrCreateUser(db, email, { displayName: profile.name || email.split("@")[0], profilePic: profile.picture || undefined });
+      saveDB(db);
+      res.type("html").send(renderOAuthDone(user));
+    } catch (err) { console.error("Google auth failed", err); res.status(500).send("Google authentication failed. Check your OAuth client settings."); }
   });
 
-  app.post("/api/auth/google", (req, res) => {
-    const email = normalizeEmail(req.body.email);
-    const user = db.users.find(u => u.email.toLowerCase() === email && u.isVerified);
-    if (!user) return res.status(401).json({ error: "Email OTP verification is required before login." });
-    res.json({ user: publicUser(user), token: user.id });
-  });
-
+  app.post("/api/auth/request-otp", (req, res) => { const email = normalizeEmail(req.body.email); if (!email.includes("@")) return res.status(400).json({ error: "A valid email address is required." }); const now = Date.now(); if (now - (otpCooldowns.get(email) || 0) < 60000) return res.status(429).json({ error: "Please wait before requesting another code." }); const otp = generateOtp(); db.emailOtps = db.emailOtps.filter(o => !(o.email === email && !o.usedAt)); db.emailOtps.push({ id: makeId("otp"), email, codeHash: hashValue(otp), expiresAt: new Date(now + OTP_TTL_MINUTES * 60000).toISOString(), attempts: 0, createdAt: new Date().toISOString() }); otpCooldowns.set(email, now); saveDB(db); console.log(`\n[GLAZE OTP] ${email}: ${otp}\n`); res.json({ success: true, message: `Access code sent to ${email}. In local VM/dev mode, check the server logs for the OTP.` }); });
+  app.post("/api/auth/verify-otp", (req, res) => { const email = normalizeEmail(req.body.email); const otp = String(req.body.otp || "").replace(/\D/g, ""); const record = [...db.emailOtps].reverse().find(o => o.email === email && !o.usedAt); if (!record) return res.status(400).json({ error: "No active code found. Request a new code." }); if (Date.now() > new Date(record.expiresAt).getTime()) return res.status(400).json({ error: "Code expired. Request a new one." }); if (record.attempts >= OTP_MAX_ATTEMPTS) return res.status(429).json({ error: "Too many wrong attempts. Request a new code." }); record.attempts += 1; if (record.codeHash !== hashValue(otp)) { saveDB(db); return res.status(400).json({ error: "Invalid access code." }); } record.usedAt = new Date().toISOString(); const user = getOrCreateUser(db, email); saveDB(db); res.json({ success: true, user: publicUser(user), token: user.id }); });
+  app.post("/api/auth/google", (req, res) => { const email = normalizeEmail(req.body.email); const user = db.users.find(u => u.email.toLowerCase() === email && u.isVerified); if (!user) return res.status(401).json({ error: "Email OTP or Google verification is required before login." }); res.json({ user: publicUser(user), token: user.id }); });
   app.get("/api/session", (req, res) => { const userId = getAuthUserId(req, db); const user = userId ? db.users.find(u => u.id === userId) : null; if (!user) return res.status(401).json({ error: "Unauthorized session" }); res.json({ user: publicUser(user) }); });
   app.post("/api/auth/logout", (_, res) => res.json({ success: true }));
 
-  app.get("/api/posts", (req, res) => {
-    const currentUserId = getAuthUserId(req, db);
-    const search = String(req.query.search || "").toLowerCase();
-    const authorId = String(req.query.userId || "");
-    let posts = [...db.posts];
-    if (authorId) posts = posts.filter(p => p.userId === authorId || db.reposts.some(r => r.postId === p.id && r.userId === authorId));
-    if (search) posts = posts.filter(p => p.content.toLowerCase().includes(search));
-    res.json(posts.map(p => enrichPost(db, p, currentUserId)).sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)));
-  });
-
-  app.post("/api/posts", (req, res) => {
-    const userId = getAuthUserId(req, db); if (!userId) return res.status(401).json({ error: "Login required." });
-    const now = Date.now(); if (now - (postCooldowns.get(userId) || 0) < 3000) return res.status(429).json({ error: "Posting too quickly." });
-    const content = String(req.body.content || "").trim(); if (!content && !req.body.image) return res.status(400).json({ error: "Post content or image is required." });
-    const post: Post = { id: makeId("post"), userId, content, image: req.body.image, createdAt: new Date().toISOString(), likesCount: 0, repostsCount: 0, commentsCount: 0 };
-    db.posts.push(post); postCooldowns.set(userId, now); saveDB(db); res.json(enrichPost(db, post, userId));
-  });
-
+  app.get("/api/posts", (req, res) => { const currentUserId = getAuthUserId(req, db); const search = String(req.query.search || "").toLowerCase(); const authorId = String(req.query.userId || ""); let posts = [...db.posts]; if (authorId) posts = posts.filter(p => p.userId === authorId || db.reposts.some(r => r.postId === p.id && r.userId === authorId)); if (search) posts = posts.filter(p => p.content.toLowerCase().includes(search)); res.json(posts.map(p => enrichPost(db, p, currentUserId)).sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt))); });
+  app.post("/api/posts", (req, res) => { const userId = getAuthUserId(req, db); if (!userId) return res.status(401).json({ error: "Login required." }); const now = Date.now(); if (now - (postCooldowns.get(userId) || 0) < 3000) return res.status(429).json({ error: "Posting too quickly." }); const content = String(req.body.content || "").trim(); if (!content && !req.body.image) return res.status(400).json({ error: "Post content or image is required." }); const post: Post = { id: makeId("post"), userId, content, image: req.body.image, createdAt: new Date().toISOString(), likesCount: 0, repostsCount: 0, commentsCount: 0 }; db.posts.push(post); postCooldowns.set(userId, now); saveDB(db); res.json(enrichPost(db, post, userId)); });
   app.delete("/api/posts/:postId", (req, res) => { const userId = getAuthUserId(req, db); const post = db.posts.find(p => p.id === req.params.postId); if (!userId || !post || post.userId !== userId) return res.status(403).json({ error: "Only the owner can delete this post." }); db.posts = db.posts.filter(p => p.id !== post.id); db.comments = db.comments.filter(c => c.postId !== post.id); db.likes = db.likes.filter(l => l.postId !== post.id); db.reposts = db.reposts.filter(r => r.postId !== post.id); saveDB(db); res.json({ success: true }); });
   app.post("/api/posts/:postId/like", (req, res) => { const userId = getAuthUserId(req, db); const post = db.posts.find(p => p.id === req.params.postId); if (!userId || !post) return res.status(401).json({ error: "Login required." }); const hit = db.likes.find(l => l.postId === post.id && l.userId === userId); let isLiked = false; if (hit) db.likes = db.likes.filter(l => l.id !== hit.id); else { db.likes.push({ id: makeId("like"), postId: post.id, userId }); isLiked = true; if (post.userId !== userId) db.notifications.push({ id: makeId("note"), type: "like", senderId: userId, receiverId: post.userId, postId: post.id, seen: false, createdAt: new Date().toISOString() }); } post.likesCount = db.likes.filter(l => l.postId === post.id).length; saveDB(db); res.json({ isLiked, likesCount: post.likesCount }); });
   app.post("/api/posts/:postId/repost", (req, res) => { const userId = getAuthUserId(req, db); const post = db.posts.find(p => p.id === req.params.postId); if (!userId || !post) return res.status(401).json({ error: "Login required." }); const hit = db.reposts.find(r => r.postId === post.id && r.userId === userId); let isReposted = false; if (hit) db.reposts = db.reposts.filter(r => r.id !== hit.id); else { db.reposts.push({ id: makeId("repost"), postId: post.id, userId }); isReposted = true; if (post.userId !== userId) db.notifications.push({ id: makeId("note"), type: "repost", senderId: userId, receiverId: post.userId, postId: post.id, seen: false, createdAt: new Date().toISOString() }); } post.repostsCount = db.reposts.filter(r => r.postId === post.id).length; saveDB(db); res.json({ isReposted, repostsCount: post.repostsCount }); });
   app.get("/api/posts/:postId/comments", (req, res) => res.json(db.comments.filter(c => c.postId === req.params.postId).map(c => ({ ...c, user: db.users.find(u => u.id === c.userId) })).sort((a, b) => +new Date(a.createdAt) - +new Date(b.createdAt))));
   app.post("/api/posts/:postId/comments", (req, res) => { const userId = getAuthUserId(req, db); const post = db.posts.find(p => p.id === req.params.postId); const content = String(req.body.content || "").trim(); if (!userId || !post || !content) return res.status(400).json({ error: "Login, post and comment are required." }); const comment: Comment = { id: makeId("comment"), postId: post.id, userId, content, createdAt: new Date().toISOString() }; db.comments.push(comment); post.commentsCount = db.comments.filter(c => c.postId === post.id).length; if (post.userId !== userId) db.notifications.push({ id: makeId("note"), type: "comment", senderId: userId, receiverId: post.userId, postId: post.id, commentId: comment.id, seen: false, createdAt: new Date().toISOString() }); saveDB(db); res.json({ ...comment, user: db.users.find(u => u.id === userId) }); });
-
   app.get("/api/users", (_, res) => res.json(db.users.map(publicUser)));
   app.get("/api/users/:id", (req, res) => { const currentUserId = getAuthUserId(req, db); const user = findUser(db, req.params.id); if (!user) return res.status(404).json({ error: "User not found." }); res.json({ user: publicUser(user), followersCount: db.follows.filter(f => f.followingId === user.id).length, followingCount: db.follows.filter(f => f.followerId === user.id).length, isFollowing: currentUserId ? db.follows.some(f => f.followerId === currentUserId && f.followingId === user.id) : false }); });
   app.post("/api/users/:id/follow", (req, res) => { const userId = getAuthUserId(req, db); const target = findUser(db, req.params.id); if (!userId || !target || target.id === userId) return res.status(400).json({ error: "Valid login and target required." }); const hit = db.follows.find(f => f.followerId === userId && f.followingId === target.id); let isFollowing = false; if (hit) db.follows = db.follows.filter(f => f.id !== hit.id); else { db.follows.push({ id: makeId("follow"), followerId: userId, followingId: target.id }); db.notifications.push({ id: makeId("note"), type: "follow", senderId: userId, receiverId: target.id, seen: false, createdAt: new Date().toISOString() }); isFollowing = true; } saveDB(db); res.json({ success: true, isFollowing }); });
-
   app.put("/api/profile", (req, res) => { const userId = getAuthUserId(req, db); const user = userId ? db.users.find(u => u.id === userId) : null; if (!user) return res.status(401).json({ error: "Login required." }); if (typeof req.body.displayName === "string") user.displayName = req.body.displayName.trim().slice(0, 60) || user.displayName; if (typeof req.body.bio === "string") user.bio = req.body.bio.trim().slice(0, 220); if (typeof req.body.profilePic === "string") user.profilePic = req.body.profilePic; if (typeof req.body.bannerPic === "string") user.bannerPic = req.body.bannerPic; if (typeof req.body.username === "string") { const username = req.body.username.toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 20); if (!username) return res.status(400).json({ error: "Username cannot be empty." }); if (db.users.some(u => u.id !== user.id && u.username.toLowerCase() === username)) return res.status(400).json({ error: "Username is already taken." }); user.username = username; } saveDB(db); res.json({ success: true, user: publicUser(user) }); });
   app.post("/api/profile/deactivate", (req, res) => { if (!getAuthUserId(req, db)) return res.status(401).json({ error: "Login required." }); res.json({ success: true }); });
   app.delete("/api/profile", (req, res) => { const userId = getAuthUserId(req, db); if (!userId) return res.status(401).json({ error: "Login required." }); db.users = db.users.filter(u => u.id !== userId); db.posts = db.posts.filter(p => p.userId !== userId); db.comments = db.comments.filter(c => c.userId !== userId); db.likes = db.likes.filter(l => l.userId !== userId); db.reposts = db.reposts.filter(r => r.userId !== userId); db.follows = db.follows.filter(f => f.followerId !== userId && f.followingId !== userId); db.notifications = db.notifications.filter(n => n.senderId !== userId && n.receiverId !== userId); db.messages = db.messages.filter(m => m.senderId !== userId && m.receiverId !== userId); saveDB(db); res.json({ success: true }); });
-
   app.get("/api/notifications", (req, res) => { const userId = getAuthUserId(req, db); if (!userId) return res.status(401).json({ error: "Login required." }); res.json(db.notifications.filter(n => n.receiverId === userId).map(n => ({ ...n, sender: db.users.find(u => u.id === n.senderId) })).sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt))); });
   app.post("/api/notifications/read", (req, res) => { const userId = getAuthUserId(req, db); if (!userId) return res.status(401).json({ error: "Login required." }); db.notifications.filter(n => n.receiverId === userId).forEach(n => n.seen = true); saveDB(db); res.json({ success: true }); });
-
   app.get("/api/messages/conversations", (req, res) => { const userId = getAuthUserId(req, db); if (!userId) return res.status(401).json({ error: "Login required." }); const map = new Map<string, { lastMessage: Message; unreadCount: number }>(); db.messages.filter(m => m.senderId === userId || m.receiverId === userId).forEach(m => { const pid = m.senderId === userId ? m.receiverId : m.senderId; const old = map.get(pid); const unread = m.senderId === pid && !m.seen ? 1 : 0; if (!old || +new Date(m.createdAt) > +new Date(old.lastMessage.createdAt)) map.set(pid, { lastMessage: m, unreadCount: (old?.unreadCount || 0) + unread }); else old.unreadCount += unread; }); res.json(Array.from(map.entries()).map(([pid, info]) => ({ user: publicUser(db.users.find(u => u.id === pid) || { id: pid, email: "", username: "deleted", displayName: "Deleted User", bio: "", profilePic: "https://api.dicebear.com/7.x/pixel-art/svg?seed=deleted", bannerPic: "", createdAt: new Date().toISOString() }), lastMessage: info.lastMessage, unreadCount: info.unreadCount })).sort((a, b) => +new Date(b.lastMessage.createdAt) - +new Date(a.lastMessage.createdAt))); });
   app.get("/api/messages/:otherUserId", (req, res) => { const userId = getAuthUserId(req, db); const other = findUser(db, req.params.otherUserId); if (!userId || !other) return res.status(404).json({ error: "Thread not found." }); const thread = db.messages.filter(m => (m.senderId === userId && m.receiverId === other.id) || (m.senderId === other.id && m.receiverId === userId)); thread.forEach(m => { if (m.senderId === other.id) m.seen = true; }); saveDB(db); res.json({ messages: thread.sort((a, b) => +new Date(a.createdAt) - +new Date(b.createdAt)), partner: publicUser(other) }); });
   app.post("/api/messages", (req, res) => { const userId = getAuthUserId(req, db); const receiver = findUser(db, String(req.body.receiverId || "")); const content = String(req.body.content || "").trim(); if (!userId || !receiver || !content) return res.status(400).json({ error: "Missing receiver or content." }); const msg: Message = { id: makeId("msg"), senderId: userId, receiverId: receiver.id, content, createdAt: new Date().toISOString(), seen: false }; db.messages.push(msg); saveDB(db); res.json(msg); });
 
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (_, res) => res.sendFile(path.join(distPath, "index.html")));
-  }
-
-  const PORT = Number(process.env.PORT || 3000);
-  app.listen(PORT, "0.0.0.0", () => console.log(`Glaze server is running at http://0.0.0.0:${PORT}`));
+  if (process.env.NODE_ENV !== "production") { const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" }); app.use(vite.middlewares); } else { const distPath = path.join(process.cwd(), "dist"); app.use(express.static(distPath)); app.get("*", (_, res) => res.sendFile(path.join(distPath, "index.html"))); }
+  const PORT = Number(process.env.PORT || 3000); app.listen(PORT, "0.0.0.0", () => console.log(`Glaze server is running at http://0.0.0.0:${PORT}`));
 }
-
 run().catch(err => { console.error("Glaze server failed to start:", err); });
