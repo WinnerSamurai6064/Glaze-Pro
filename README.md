@@ -2,10 +2,6 @@
 
 Full-stack social web app for https://glaze.kje.us.
 
-## Run
+## Visit
 
-```bash
-npm install
-npm run build
-npm run start
-```
+`
